@@ -22,5 +22,7 @@ add_executable(QtChatRelay
     src/relay_main.cpp
     src/relayserver.h
     src/relayserver.cpp
+    src/udpbridge.h
+    src/udpbridge.cpp
 )
 target_link_libraries(QtChatRelay PRIVATE Qt6::Core Qt6::Network)

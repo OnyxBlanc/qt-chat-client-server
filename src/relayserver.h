@@ -6,16 +6,13 @@
 #include <QHash>
 #include <QByteArray>
 #include <QString>
+#include "udpbridge.h"
 
-// Coeur du serveur relais : accepte plusieurs clients et retransmet
-// chaque message JSON recu (une ligne = un message) a tous les autres
-// clients connectes. Utilise le meme protocole que ConnectionManager
-// (src/connectionmanager.h), donc compatible avec QtChatApp.
 class RelayServer : public QObject {
     Q_OBJECT
 public:
     explicit RelayServer(QObject *parent = nullptr);
-
+    bool start(quint16 tcpPort, quint16 udpPort);
     bool start(quint16 port);
 
 signals:
@@ -23,14 +20,18 @@ signals:
 
 private slots:
     void onNewConnection();
+    void onUdpMessage(const QByteArray &message, const UdpPeer &sender);
 
 private:
     void onReadyRead(QTcpSocket *client);
     void onDisconnected(QTcpSocket *client);
-    void relay(const QByteArray &line, QTcpSocket *from);
+    void routeMessage(const QByteArray &line, QTcpSocket *tcpSender = nullptr, const UdpPeer *udpSender = nullptr);
+    void broadcastTcp(const QByteArray &message, QTcpSocket *exclude = nullptr);
+    void logJson(const QByteArray &message, const QString &transport);
 
-    QTcpServer m_server;
-    QList<QTcpSocket *> m_clients;
-    QHash<QTcpSocket *, QByteArray> m_buffers;
-    QHash<QTcpSocket *, QString> m_labels;
+    QTcpServer m_tcpServer;
+    QList<QTcpSocket *> m_tcpClients;
+    QHash<QTcpSocket *, QByteArray> m_tcpBuffers;
+    QHash<QTcpSocket *, QString> m_tcpLabels;
+    UdpBridge m_udp;
 };
