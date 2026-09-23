@@ -1,12 +1,11 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
-#include <QColorDialog>
 #include <QDateTime>
+#include <QDialog>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
-#include <QHostAddress>
 #include <QInputDialog>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -16,210 +15,319 @@
 #include <QMessageBox>
 #include <QNetworkInterface>
 #include <QPushButton>
-#include <QRandomGenerator>
+#include <QSettings>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTextEdit>
 #include <QVBoxLayout>
-#include <QWidget>
 
-class ChatWindow final : public QWidget {
+// Chat multi-utilisateurs : un serveur TCP local relaie les messages
+// a tous les clients connectes sur le meme canal. Chaque client garde
+// aussi une connexion sortante s'il rejoint un serveur distant.
+class Chat : public QWidget {
+    struct ClientInfo { QString id; QString pseudo; bool identified = false; };
+
+    QTcpServer server;
+    QList<QTcpSocket*> clients;
+    QHash<QTcpSocket*, QByteArray> buffers;
+    QHash<QTcpSocket*, ClientInfo> clientInfo;
+
+    QTcpSocket *outgoing = nullptr;
+    QByteArray outgoingBuffer;
+
+    QString id, pseudo;
+    int port;
+    bool automatic;
+
+    QTextEdit *history;
+    QLineEdit *input;
+    QLabel *ip, *portLabel, *countLabel;
+    QListWidget *userList;
+
 public:
-    ChatWindow() {
-        setWindowTitle("Qt Chat - Client / Serveur");
-        resize(920, 620);
-        m_id = "PC-" + QString::number(QRandomGenerator::global()->bounded(100, 1000));
-        buildUi();
-        applyTheme();
+    Chat() {
+        QSettings s("OnyxBlanc", "QtChatApp");
+        id = s.value("id", "PC-001").toString();
+        pseudo = s.value("pseudo", "Utilisateur").toString();
+        port = s.value("port", 5000).toInt();
+        automatic = s.value("automatic", true).toBool();
+
+        setWindowTitle("Qt Chat - Salon multi-utilisateurs");
+        resize(1000, 660);
+        build();
+        applyStyle();
+
+        connect(&server, &QTcpServer::newConnection, this, [this] { acceptClients(); });
+
+        if (automatic) listen();
     }
 
-private:
-    QString m_id;
-    QString m_pseudo = "Utilisateur";
-    QString m_darkColor = "#424C8F";
-    QString m_lightColor = "#A1ADED";
-    bool m_dark = true;
-    QTcpServer *m_server = nullptr;
-    QTcpSocket *m_socket = nullptr;
-    QList<QTcpSocket *> m_clients;
-    QHash<QTcpSocket *, QByteArray> m_buffers;
-    QByteArray m_clientBuffer;
-    QTextEdit *m_history = nullptr;
-    QLineEdit *m_message = nullptr;
-    QListWidget *m_servers = nullptr;
-    QLabel *m_ip = nullptr;
-    QLabel *m_port = nullptr;
-    QCheckBox *m_auto = nullptr;
-
-    static QString localIp() {
-        for (const auto &address : QNetworkInterface::allAddresses()) {
-            if (address.protocol() == QAbstractSocket::IPv4Protocol && !address.isLoopback()) return address.toString();
-        }
+    QString localIp() {
+        for (const auto &a : QNetworkInterface::allAddresses())
+            if (a.protocol() == QAbstractSocket::IPv4Protocol && !a.isLoopback())
+                return a.toString();
         return "127.0.0.1";
     }
 
-    void buildUi() {
+    void build() {
         auto *settings = new QPushButton("⚙ Paramètres");
-        connect(settings, &QPushButton::clicked, this, [this] { openSettings(); });
-        auto *title = new QLabel("Chat client / serveur local");
+        connect(settings, &QPushButton::clicked, this, [this] { configure(); });
+        auto *title = new QLabel("SALON DE DISCUSSION LOCAL");
         title->setAlignment(Qt::AlignCenter);
         auto *top = new QHBoxLayout;
         top->addWidget(settings);
         top->addWidget(title, 1);
 
-        m_history = new QTextEdit;
-        m_history->setReadOnly(true);
-        m_history->setPlaceholderText("Historique : ID - Pseudo : message");
-        m_message = new QLineEdit;
-        m_message->setPlaceholderText("Zone d'écriture...");
-        auto *send = new QPushButton("Envoyer ➜");
+        history = new QTextEdit;
+        history->setReadOnly(true);
+        history->setPlaceholderText("Les messages du salon apparaîtront ici...");
+        input = new QLineEdit;
+        input->setPlaceholderText("Écrire un message pour tout le salon...");
+        auto *send = new QPushButton("Envoyer  ➜");
         connect(send, &QPushButton::clicked, this, [this] { sendMessage(); });
-        connect(m_message, &QLineEdit::returnPressed, this, [this] { sendMessage(); });
+        connect(input, &QLineEdit::returnPressed, this, [this] { sendMessage(); });
         auto *write = new QHBoxLayout;
-        write->addWidget(m_message);
+        write->addWidget(input);
         write->addWidget(send);
 
-        m_ip = new QLabel(localIp());
-        m_port = new QLabel("Aucun serveur actif");
+        ip = new QLabel(localIp());
+        portLabel = new QLabel;
         auto *copyIp = new QPushButton("Copier IP");
         auto *copyPort = new QPushButton("Copier port");
-        connect(copyIp, &QPushButton::clicked, this, [this] { QApplication::clipboard()->setText(m_ip->text()); });
-        connect(copyPort, &QPushButton::clicked, this, [this] { QApplication::clipboard()->setText(m_port->text()); });
-        auto *network = new QGroupBox("Vos coordonnées réseau");
-        auto *networkLayout = new QFormLayout(network);
-        auto *ipRow = new QHBoxLayout; ipRow->addWidget(m_ip); ipRow->addWidget(copyIp);
-        auto *portRow = new QHBoxLayout; portRow->addWidget(m_port); portRow->addWidget(copyPort);
-        networkLayout->addRow("Votre IP :", ipRow);
-        networkLayout->addRow("Votre port :", portRow);
+        connect(copyIp, &QPushButton::clicked, this, [this] { QApplication::clipboard()->setText(ip->text()); });
+        connect(copyPort, &QPushButton::clicked, this, [this] { QApplication::clipboard()->setText(QString::number(port)); });
+        auto *network = new QGroupBox("CONNEXION LOCALE");
+        auto *f = new QFormLayout(network);
+        f->addRow("IP locale", ip);
+        f->addRow("Port", portLabel);
+        f->addRow(copyIp, copyPort);
 
         auto *left = new QVBoxLayout;
         left->addLayout(top);
-        left->addWidget(m_history, 1);
+        left->addWidget(history, 1);
         left->addLayout(write);
         left->addWidget(network);
 
-        m_servers = new QListWidget;
-        connect(m_servers, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) { connectEntry(item); });
-        auto *add = new QPushButton("+");
-        auto *remove = new QPushButton("Retirer");
-        connect(add, &QPushButton::clicked, this, [this] { addConnection(); });
-        connect(remove, &QPushButton::clicked, this, [this] { delete m_servers->takeItem(m_servers->currentRow()); });
-        m_auto = new QCheckBox("Mode automatique");
-        connect(m_auto, &QCheckBox::toggled, this, [this](bool enabled) { if (enabled && m_servers->count()) connectEntry(m_servers->item(0)); });
-        auto *connections = new QGroupBox("Liste des serveurs");
-        auto *connectionsLayout = new QVBoxLayout(connections);
-        connectionsLayout->addWidget(m_servers, 1);
-        auto *buttons = new QHBoxLayout; buttons->addWidget(add); buttons->addWidget(remove); buttons->addStretch();
-        connectionsLayout->addLayout(buttons);
-        connectionsLayout->addWidget(m_auto);
+        userList = new QListWidget;
+        countLabel = new QLabel("0 connecté(s)");
+        auto *add = new QPushButton("＋ Rejoindre un autre salon");
+        connect(add, &QPushButton::clicked, this, [this] { join(); });
+        auto *rightBox = new QGroupBox("PARTICIPANTS DU SALON");
+        auto *r = new QVBoxLayout(rightBox);
+        r->addWidget(countLabel);
+        r->addWidget(userList, 1);
+        r->addWidget(add);
 
-        auto *games = new QPushButton("Zone de jeux\n(en construction)");
-        games->setEnabled(false);
-        games->setMinimumHeight(95);
+        auto *game = new QPushButton("ZONE DE JEUX\nBientôt disponible");
+        game->setEnabled(false);
+
         auto *right = new QVBoxLayout;
-        right->addWidget(connections, 1);
-        right->addWidget(games);
+        right->addWidget(rightBox, 1);
+        right->addWidget(game);
 
         auto *layout = new QHBoxLayout(this);
         layout->addLayout(left, 3);
         layout->addLayout(right, 1);
+        updateStatus();
     }
 
-    void applyTheme() {
-        const QString background = m_dark ? m_darkColor : m_lightColor;
-        const QString foreground = m_dark ? "#F4F5FF" : "#111426";
-        setStyleSheet(QString("QWidget { background:%1; color:%2; } QGroupBox, QTextEdit, QLineEdit, QListWidget { border:1px solid %2; border-radius:5px; } QTextEdit, QLineEdit, QListWidget { background:rgba(255,255,255,30); } QPushButton { border:1px solid %2; border-radius:5px; padding:6px; background:rgba(255,255,255,35); } QPushButton:disabled { color:#777; border-color:#777; }").arg(background, foreground));
+    void applyStyle() {
+        setStyleSheet(
+            "QWidget{background:#101427;color:#e8ecff;font:10pt Segoe UI;}"
+            "QGroupBox{border:1px solid #424C8F;border-radius:10px;margin-top:12px;padding:10px;}"
+            "QGroupBox::title{color:#a1aded;}"
+            "QTextEdit,QLineEdit,QListWidget{background:#181f3c;border:1px solid #4b5a9e;border-radius:8px;padding:7px;}"
+            "QPushButton{background:#424C8F;border:0;border-radius:8px;padding:9px 12px;font-weight:600;}"
+            "QPushButton:hover{background:#5969b4;}"
+            "QPushButton:disabled{background:#252b45;color:#69708e;}"
+        );
     }
 
-    void openSettings() {
-        QDialog dialog(this); dialog.setWindowTitle("Paramètres");
-        QLineEdit id(m_id), pseudo(m_pseudo), dark(m_darkColor), light(m_lightColor);
-        QCheckBox mode("Utiliser le mode foncé"); mode.setChecked(m_dark);
-        auto *form = new QFormLayout(&dialog);
-        form->addRow("ID :", &id); form->addRow("Pseudo :", &pseudo); form->addRow("Couleur foncée (hex) :", &dark); form->addRow("Couleur claire (hex) :", &light); form->addRow(&mode);
-        auto *ok = new QPushButton("Valider"); form->addRow(ok);
-        connect(ok, &QPushButton::clicked, &dialog, &QDialog::accept);
-        if (dialog.exec() == QDialog::Accepted && !id.text().trimmed().isEmpty() && !pseudo.text().trimmed().isEmpty()) {
-            m_id = id.text().trimmed(); m_pseudo = pseudo.text().trimmed();
-            if (QColor(dark.text()).isValid()) m_darkColor = QColor(dark.text()).name();
-            if (QColor(light.text()).isValid()) m_lightColor = QColor(light.text()).name();
-            m_dark = mode.isChecked(); applyTheme();
+    void updateStatus() {
+        portLabel->setText(server.isListening() ? QString::number(port) + " • salon ouvert" : "fermé");
+    }
+
+    void log(const QString &who, const QString &text) {
+        history->append("[" + QDateTime::currentDateTime().toString("HH:mm") + "] " + who + " : " + text.toHtmlEscaped());
+    }
+
+    void refreshUserList() {
+        userList->clear();
+        userList->addItem("● " + id + " - " + pseudo + " (vous, hôte)");
+        for (auto *c : clients) {
+            const auto info = clientInfo.value(c);
+            if (info.identified)
+                userList->addItem("○ " + info.id + " - " + info.pseudo);
+            else
+                userList->addItem("○ Connexion en cours...");
+        }
+        countLabel->setText(QString::number(clients.size() + 1) + " connecté(s)");
+    }
+
+    QByteArray frame(const QJsonObject &o) {
+        return QJsonDocument(o).toJson(QJsonDocument::Compact) + '\n';
+    }
+
+    void broadcastToClients(const QByteArray &line, QTcpSocket *exclude = nullptr) {
+        for (auto *c : clients)
+            if (c != exclude) c->write(line);
+    }
+
+    void handleIncomingLine(const QByteArray &line, QTcpSocket *from) {
+        const auto doc = QJsonDocument::fromJson(line);
+        if (!doc.isObject()) return;
+        const auto o = doc.object();
+
+        auto &info = clientInfo[from];
+        info.id = o["id"].toString();
+        info.pseudo = o["pseudo"].toString();
+        info.identified = true;
+
+        log(info.id + " - " + info.pseudo, o["message"].toString());
+        broadcastToClients(line, from);
+        refreshUserList();
+    }
+
+    void acceptClients() {
+        while (server.hasPendingConnections()) {
+            QTcpSocket *c = server.nextPendingConnection();
+            clients << c;
+            clientInfo[c] = ClientInfo{};
+
+            connect(c, &QTcpSocket::readyRead, this, [this, c] {
+                auto &b = buffers[c];
+                b += c->readAll();
+                while (b.contains('\n')) {
+                    int n = b.indexOf('\n');
+                    const auto line = b.left(n);
+                    b.remove(0, n + 1);
+                    handleIncomingLine(line, c);
+                }
+            });
+
+            connect(c, &QTcpSocket::disconnected, this, [this, c] {
+                const auto info = clientInfo.value(c);
+                if (info.identified) log("SYSTÈME", info.id + " - " + info.pseudo + " a quitté le salon.");
+                clients.removeAll(c);
+                buffers.remove(c);
+                clientInfo.remove(c);
+                c->deleteLater();
+                refreshUserList();
+            });
+
+            refreshUserList();
         }
     }
 
-    void log(const QString &id, const QString &pseudo, const QString &message) {
-        m_history->append(QString("[%1] %2 - %3 : %4").arg(QDateTime::currentDateTime().toString("HH:mm"), id, pseudo, message.toHtmlEscaped()));
-    }
-
-    void handleLine(const QByteArray &line) {
-        const QJsonDocument document = QJsonDocument::fromJson(line);
-        if (!document.isObject()) return;
-        const QJsonObject object = document.object();
-        log(object["id"].toString(), object["pseudo"].toString(), object["message"].toString());
+    void listen() {
+        if (server.isListening()) server.close();
+        if (server.listen(QHostAddress::Any, port)) {
+            log("SYSTÈME", "Salon ouvert sur le port " + QString::number(port) + " (hôte : " + id + " - " + pseudo + ")");
+        } else {
+            QMessageBox::warning(this, "Port indisponible", server.errorString());
+        }
+        updateStatus();
+        refreshUserList();
     }
 
     void sendMessage() {
-        const QString text = m_message->text().trimmed();
+        const auto text = input->text().trimmed();
         if (text.isEmpty()) return;
-        if (!m_server && !m_socket) { QMessageBox::information(this, "Connexion", "Héberge ou rejoins un serveur avant d'envoyer un message."); return; }
-        QJsonObject object{{"id", m_id}, {"pseudo", m_pseudo}, {"message", text}};
-        const QByteArray line = QJsonDocument(object).toJson(QJsonDocument::Compact) + '\n';
-        if (m_server) { for (auto *client : m_clients) client->write(line); log(m_id, m_pseudo, text); }
-        else if (m_socket) m_socket->write(line);
-        m_message->clear();
+
+        const QJsonObject o{{"id", id}, {"pseudo", pseudo}, {"message", text}};
+        const auto line = frame(o);
+
+        if (server.isListening()) {
+            log(id + " - " + pseudo, text);
+            broadcastToClients(line);
+        } else if (outgoing && outgoing->state() == QAbstractSocket::ConnectedState) {
+            outgoing->write(line);
+        } else {
+            QMessageBox::information(this, "Aucun salon actif", "Héberge un salon (Paramètres) ou rejoins-en un avant d'envoyer un message.");
+            return;
+        }
+        input->clear();
     }
 
-    void startServer(quint16 port) {
-        closeConnections();
-        m_server = new QTcpServer(this);
-        if (!m_server->listen(QHostAddress::Any, port)) { QMessageBox::warning(this, "Serveur", m_server->errorString()); m_server->deleteLater(); m_server = nullptr; return; }
-        connect(m_server, &QTcpServer::newConnection, this, [this] {
-            while (m_server->hasPendingConnections()) {
-                QTcpSocket *client = m_server->nextPendingConnection(); m_clients << client;
-                connect(client, &QTcpSocket::readyRead, this, [this, client] {
-                    QByteArray &buffer = m_buffers[client]; buffer += client->readAll();
-                    while (buffer.contains('\n')) { const int end = buffer.indexOf('\n'); const QByteArray line = buffer.left(end); buffer.remove(0, end + 1); handleLine(line); for (auto *other : m_clients) if (other != client) other->write(line + '\n'); }
-                });
-                connect(client, &QTcpSocket::disconnected, this, [this, client] { m_clients.removeAll(client); m_buffers.remove(client); client->deleteLater(); });
+    void join() {
+        bool ok;
+        const auto host = QInputDialog::getText(this, "Rejoindre un salon", "IP de l'hôte :", QLineEdit::Normal, "127.0.0.1", &ok);
+        if (!ok || host.isEmpty()) return;
+        const int p = QInputDialog::getInt(this, "Rejoindre un salon", "Port :", port, 1, 65535, 1, &ok);
+        if (!ok) return;
+
+        if (server.isListening()) { server.close(); updateStatus(); }
+
+        if (outgoing) { outgoing->disconnectFromHost(); outgoing->deleteLater(); }
+        outgoing = new QTcpSocket(this);
+
+        connect(outgoing, &QTcpSocket::connected, this, [this, host, p] {
+            log("SYSTÈME", "Connecté au salon distant " + host + ":" + QString::number(p));
+        });
+        connect(outgoing, &QTcpSocket::readyRead, this, [this] {
+            outgoingBuffer += outgoing->readAll();
+            while (outgoingBuffer.contains('\n')) {
+                int n = outgoingBuffer.indexOf('\n');
+                const auto line = outgoingBuffer.left(n);
+                outgoingBuffer.remove(0, n + 1);
+                const auto doc = QJsonDocument::fromJson(line);
+                if (doc.isObject()) {
+                    const auto o = doc.object();
+                    log(o["id"].toString() + " - " + o["pseudo"].toString(), o["message"].toString());
+                }
             }
         });
-        m_port->setText(QString::number(port)); log("SYSTÈME", "Serveur", "Serveur local démarré sur le port " + QString::number(port));
+        connect(outgoing, &QTcpSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
+            log("SYSTÈME", "Erreur : " + outgoing->errorString());
+        });
+
+        outgoing->connectToHost(host, static_cast<quint16>(p));
     }
 
-    void joinServer(const QString &host, quint16 port) {
-        closeConnections(); m_socket = new QTcpSocket(this);
-        connect(m_socket, &QTcpSocket::connected, this, [this, host, port] { log("SYSTÈME", "Client", "Connecté à " + host + ":" + QString::number(port)); });
-        connect(m_socket, &QTcpSocket::readyRead, this, [this] { m_clientBuffer += m_socket->readAll(); while (m_clientBuffer.contains('\n')) { const int end = m_clientBuffer.indexOf('\n'); const QByteArray line = m_clientBuffer.left(end); m_clientBuffer.remove(0, end + 1); handleLine(line); } });
-        connect(m_socket, &QTcpSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) { log("SYSTÈME", "Erreur", m_socket->errorString()); });
-        m_socket->connectToHost(host, port); m_port->setText(QString::number(port));
-    }
+    void configure() {
+        QDialog d(this);
+        d.setWindowTitle("Paramètres");
+        QLineEdit i(id), p(pseudo);
+        QLineEdit po(QString::number(port));
+        QCheckBox a("Héberger automatiquement un salon au lancement");
+        a.setChecked(automatic);
 
-    void closeConnections() {
-        if (m_server) { m_server->close(); m_server->deleteLater(); m_server = nullptr; }
-        for (auto *client : m_clients) { client->disconnectFromHost(); client->deleteLater(); }
-        m_clients.clear(); m_buffers.clear();
-        if (m_socket) { m_socket->disconnectFromHost(); m_socket->deleteLater(); m_socket = nullptr; }
-    }
+        auto *f = new QFormLayout(&d);
+        f->addRow("ID", &i);
+        f->addRow("Pseudo", &p);
+        f->addRow("Port d'écoute", &po);
+        f->addRow(&a);
+        auto *ok = new QPushButton("Enregistrer");
+        f->addRow(ok);
+        connect(ok, &QPushButton::clicked, &d, &QDialog::accept);
 
-    void addConnection() {
-        bool ok = false;
-        const QString role = QInputDialog::getItem(this, "Connexion", "Action :", {"Héberger un serveur", "Rejoindre un serveur"}, 0, false, &ok);
-        if (!ok) return;
-        const int port = QInputDialog::getInt(this, "Port", "Port TCP :", 5000, 1, 65535, 1, &ok);
-        if (!ok) return;
-        if (role.startsWith("Héberger")) { startServer(quint16(port)); m_servers->addItem("LOCAL:" + QString::number(port)); }
-        else { const QString host = QInputDialog::getText(this, "Serveur distant", "Adresse IP :", QLineEdit::Normal, "127.0.0.1", &ok); if (ok && !host.isEmpty()) { m_servers->addItem(host + ":" + QString::number(port)); joinServer(host, quint16(port)); } }
-    }
+        if (d.exec() == QDialog::Accepted) {
+            bool valid;
+            int newPort = po.text().toInt(&valid);
+            if (!valid || newPort < 1 || newPort > 65535) {
+                QMessageBox::warning(this, "Port", "Entre un port entre 1 et 65535.");
+                return;
+            }
+            id = i.text().trimmed();
+            pseudo = p.text().trimmed();
+            port = newPort;
+            automatic = a.isChecked();
 
-    void connectEntry(QListWidgetItem *item) {
-        const QString entry = item->text(); if (entry.startsWith("LOCAL:")) { startServer(quint16(entry.section(':', 1).toUShort())); return; }
-        const int separator = entry.lastIndexOf(':'); if (separator > 0) joinServer(entry.left(separator), quint16(entry.mid(separator + 1).toUShort()));
+            QSettings s("OnyxBlanc", "QtChatApp");
+            s.setValue("id", id);
+            s.setValue("pseudo", pseudo);
+            s.setValue("port", port);
+            s.setValue("automatic", automatic);
+
+            if (automatic) listen();
+            else { server.close(); updateStatus(); refreshUserList(); }
+        }
     }
 };
 
 int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
-    ChatWindow window;
+    Chat window;
     window.show();
     return app.exec();
 }
