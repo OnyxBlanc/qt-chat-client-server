@@ -1,0 +1,83 @@
+name: Build Qt application
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Windows executable
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: ''
+
+      - name: Configure CMake
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build release executable
+        run: cmake --build build --config Release --parallel
+
+      - name: Bundle Qt DLLs
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build -Filter QtChatApp.exe -Recurse | Select-Object -First 1
+          if ($null -eq $exe) { throw "QtChatApp.exe introuvable" }
+          windeployqt --release --compiler-runtime $exe.FullName
+          New-Item -ItemType Directory -Force -Path dist/windows | Out-Null
+          Copy-Item -Path $exe.DirectoryName\* -Destination dist/windows -Recurse -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QtChatApp-Windows-x64
+          path: dist/windows
+          if-no-files-found: error
+
+  build-linux:
+    name: Linux executable
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Qt and build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ qt6-base-dev
+
+      - name: Configure CMake
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Linux executable
+        run: cmake --build build --parallel
+
+      - name: Package Linux artifact
+        run: |
+          mkdir -p dist/linux
+          cp build/QtChatApp dist/linux/
+          chmod +x dist/linux/QtChatApp
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QtChatApp-Linux-x64
+          path: dist/linux
+          if-no-files-found: error
