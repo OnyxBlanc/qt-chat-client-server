@@ -1,0 +1,1 @@
+SettingsDialog header - ID/Pseudo/theme colors.

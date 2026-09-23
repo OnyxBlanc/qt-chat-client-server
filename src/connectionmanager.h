@@ -1,0 +1,1 @@
+ConnectionManager header - TCP server/client role handling.
