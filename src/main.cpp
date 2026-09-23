@@ -242,6 +242,7 @@ public:
             broadcastToClients(line);
         } else if (outgoing && outgoing->state() == QAbstractSocket::ConnectedState) {
             outgoing->write(line);
+            log(id + " - " + pseudo, text);
         } else {
             QMessageBox::information(this, "Aucun salon actif", "Héberge un salon (Paramètres) ou rejoins-en un avant d'envoyer un message.");
             return;
@@ -256,7 +257,14 @@ public:
         const int p = QInputDialog::getInt(this, "Rejoindre un salon", "Port :", port, 1, 65535, 1, &ok);
         if (!ok) return;
 
-        if (server.isListening()) { server.close(); updateStatus(); }
+        if (server.isListening()) {
+            const auto choice = QMessageBox::question(this, "Quitter l'hébergement ?",
+                "Tu héberges déjà un salon : le rejoindre un autre va fermer ton salon actuel et déconnecter tout le monde. Continuer ?",
+                QMessageBox::Yes | QMessageBox::No);
+            if (choice != QMessageBox::Yes) return;
+            server.close();
+            updateStatus();
+        }
 
         if (outgoing) { outgoing->disconnectFromHost(); outgoing->deleteLater(); }
         outgoing = new QTcpSocket(this);
